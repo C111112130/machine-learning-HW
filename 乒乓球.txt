@@ -1,0 +1,271 @@
+import gymnasium as gym
+from gymnasium import spaces
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+from collections import deque
+import numpy as np
+import os
+import pygame 
+import torch.nn.functional as F
+import matplotlib.pyplot as plt 
+
+# --- 1. 訓練參數 ---
+BATCH_SIZE = 64
+GAMMA = 0.99
+EPS_START = 1.0        
+EPS_END = 0.05
+EPS_DECAY = 0.99998    
+LEARNING_RATE = 1e-4 
+REPLAY_BUFFER_CAPACITY = 20000 
+TARGET_UPDATE_TAU = 0.005 
+TRAIN_FREQ = 4            
+FINAL_CHECKPOINT_PATH = "final_model/latest_checkpoint.pth"
+
+# --- 2. 物理與獎勵參數 ---
+PADDLE_SPEED = 12.0       
+MAX_BALL_SPEED = 9.0     
+BASE_HIT_REWARD = 10.0      
+MIN_HIT_REWARD = 3.0        
+DECAY_PER_STEP = 0.2        
+DECAY_INTERVAL_EP = 700    
+FRAME_SKIP = 2             # 維持跳幀決策，讓移動不抖動但「不加減分」
+
+# --- 0. 環境設定 ---
+class CustomPongEnv(gym.Env):
+    metadata = {"render_modes": ["human"], "render_fps": 60}
+
+    def __init__(self, render_mode=None):
+        super().__init__()
+        self.width, self.height = 600, 400
+        self.info_height = 40 
+        self.paddle_width, self.paddle_height = 10, 60
+        self.ball_size = 10
+        self.action_space = spaces.Discrete(3) 
+        self.observation_space = spaces.Box(low=0, high=600, shape=(6,), dtype=np.float32)
+        self.window, self.clock, self.font = None, None, None
+
+    def init_pygame_window(self):
+        if self.window is None:
+            pygame.init()
+            self.window = pygame.display.set_mode((self.width, self.height + self.info_height)) 
+            pygame.display.set_caption("DQN Pong - Pure Catch Mode")
+            self.clock = pygame.time.Clock()
+            self.font = pygame.font.SysFont(None, 24)
+
+    def _reset_ball(self):
+        self.ball_pos = np.array([self.width / 2, self.height / 2], dtype=np.float32)
+        angle = random.uniform(-np.pi/6, np.pi/6)
+        iv = random.uniform(3, 5)
+        self.ball_vel = np.array([iv * np.cos(angle) * random.choice([-1, 1]), 
+                                 iv * np.sin(angle)], dtype=np.float32)
+
+    def _get_obs(self):
+        return np.array([self.ball_pos[0], self.ball_pos[1], self.ball_vel[0], self.ball_vel[1], 
+                         self.paddle_a_y, self.paddle_b_y], dtype=np.float32)
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self._reset_ball()
+        self.paddle_a_y = self.height / 2 - self.paddle_height / 2
+        self.paddle_b_y = self.height / 2 - self.paddle_height / 2
+        self.steps_since_last_hit = 0
+        return self._get_obs(), {}
+
+    def step(self, action, current_hit_reward):
+        # 物理移動邏輯
+        paddle_a_vel = (action - 1) * PADDLE_SPEED
+        self.paddle_a_y = np.clip(self.paddle_a_y + paddle_a_vel, 0, self.height - self.paddle_height)
+        
+        target_y = self.ball_pos[1] - self.paddle_height / 2
+        self.paddle_b_y += np.clip(target_y - self.paddle_b_y, -8, 8)
+        self.paddle_b_y = np.clip(self.paddle_b_y, 0, self.height - self.paddle_height)
+
+        self.ball_pos += self.ball_vel
+        self.steps_since_last_hit += 1
+        reward, done = 0.0, False
+        
+        # --- 移動時的分數加減已全部拿掉 ---
+        # 這裡現在完全沒有任何關於移動方向或抖動的 reward += 或 reward -= 
+
+        if self.ball_pos[1] <= self.ball_size or self.ball_pos[1] >= self.height - self.ball_size:
+            self.ball_vel[1] *= -1
+
+        # 擊球與結果判定
+        if (self.ball_pos[0] <= 15 + self.ball_size and 
+            self.paddle_a_y <= self.ball_pos[1] <= self.paddle_a_y + self.paddle_height):
+            if self.ball_vel[0] < 0:
+                new_v_x = min(MAX_BALL_SPEED, abs(self.ball_vel[0]) * 1.05)
+                self.ball_vel[0] = new_v_x
+                reward = current_hit_reward  # 專注於接球加分
+                self.steps_since_last_hit = 0
+
+        if (self.ball_pos[0] >= self.width - 15 - self.ball_size and
+            self.paddle_b_y <= self.ball_pos[1] <= self.paddle_b_y + self.paddle_height):
+            if self.ball_vel[0] > 0:
+                new_v_x = min(MAX_BALL_SPEED, abs(self.ball_vel[0]) * 1.05)
+                self.ball_vel[0] = -new_v_x
+                self.steps_since_last_hit = 0
+
+        if self.ball_pos[0] < 0: 
+            reward = -20.0 # 失分懲罰
+            done = True
+        elif self.ball_pos[0] > self.width: 
+            reward = 10.0 # 對手失分獎勵
+            done = True
+        
+        if self.steps_since_last_hit > 2000: done = True
+
+        return self._get_obs(), reward, done, False, {}
+
+    def render(self, episode=0, ep_reward=0.0, current_epsilon=0.0, hit_reward=0.0):
+        self.window.fill((0, 0, 0))
+        pygame.draw.rect(self.window, (255, 255, 255), (5, int(self.paddle_a_y), self.paddle_width, self.paddle_height))
+        pygame.draw.rect(self.window, (255, 255, 255), (self.width-15, int(self.paddle_b_y), self.paddle_width, self.paddle_height))
+        pygame.draw.circle(self.window, (255, 255, 255), (int(self.ball_pos[0]), int(self.ball_pos[1])), self.ball_size)
+
+        info = f"EP {episode} | Score: {ep_reward:.1f} | Hit+: {hit_reward:.1f} | Eps: {current_epsilon:.3f}"
+        text = self.font.render(info, True, (255, 255, 255))
+        self.window.blit(text, (10, self.height + 10)) 
+        pygame.display.flip()
+        self.clock.tick(120)
+
+# --- DQN 模型 ---
+class DQN(nn.Module):
+    def __init__(self, input_shape, n_actions):
+        super(DQN, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_shape[0], 128), nn.ReLU(),
+            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(128, n_actions)
+        )
+    def forward(self, x): return self.fc(x)
+
+class ReplayBuffer:
+    def __init__(self, capacity): self.buffer = deque(maxlen=capacity)
+    def push(self, *args): self.buffer.append(args)
+    def sample(self, batch_size):
+        s, a, r, ns, d = zip(*random.sample(self.buffer, batch_size))
+        return torch.tensor(np.array(s), dtype=torch.float32), torch.tensor(a, dtype=torch.long), \
+               torch.tensor(r, dtype=torch.float32), torch.tensor(np.array(ns), dtype=torch.float32), torch.tensor(d, dtype=torch.float32)
+    def __len__(self): return len(self.buffer)
+
+class DQNAgent:
+    def __init__(self, input_shape, n_actions, device):
+        self.device = device
+        self.n_actions = n_actions
+        self.policy_net = DQN(input_shape, n_actions).to(device)
+        self.target_net = DQN(input_shape, n_actions).to(device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LEARNING_RATE)
+        self.memory = ReplayBuffer(REPLAY_BUFFER_CAPACITY)
+        self.epsilon = EPS_START
+        self.total_steps = 0
+
+    def select_action(self, state):
+        self.epsilon = max(EPS_END, self.epsilon * EPS_DECAY)
+        if random.random() < self.epsilon: return random.randrange(self.n_actions)
+        with torch.no_grad():
+            state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+            return self.policy_net(state_t).argmax(1).item()
+
+    def learn(self):
+        if len(self.memory) < BATCH_SIZE: return
+        s, a, r, ns, d = self.memory.sample(BATCH_SIZE)
+        s, a, r, ns, d = s.to(self.device), a.to(self.device), r.to(self.device), ns.to(self.device), d.to(self.device)
+        q_values = self.policy_net(s).gather(1, a.unsqueeze(1)).squeeze(1)
+        next_actions = self.policy_net(ns).argmax(1).unsqueeze(1)
+        next_q = self.target_net(ns).gather(1, next_actions).squeeze(1).detach()
+        target_q = r + (1 - d) * GAMMA * next_q
+        loss = F.smooth_l1_loss(q_values, target_q)
+        self.optimizer.zero_grad(); loss.backward(); self.optimizer.step()
+        for tp, pp in zip(self.target_net.parameters(), self.policy_net.parameters()):
+            tp.data.copy_(TARGET_UPDATE_TAU * pp.data + (1.0 - TARGET_UPDATE_TAU) * tp.data)
+
+    def save_checkpoint(self, path, episode):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({'policy_net_state_dict': self.policy_net.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'total_steps': self.total_steps, 'epsilon': self.epsilon, 'episode': episode}, path)
+
+    def load_checkpoint(self, path):
+        if not os.path.exists(path): return 0
+        ckpt = torch.load(path, map_location=self.device)
+        self.policy_net.load_state_dict(ckpt['policy_net_state_dict'])
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        self.total_steps = ckpt.get('total_steps', 0)
+        self.epsilon = ckpt.get('epsilon', EPS_START)
+        return ckpt.get('episode', 0)
+
+# --- 2. 訓練流程 ---
+def start_live_training():
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    env = CustomPongEnv()
+    agent = DQNAgent((6,), env.action_space.n, DEVICE)
+    start_ep = agent.load_checkpoint(FINAL_CHECKPOINT_PATH)
+    env.init_pygame_window()
+    
+    episode_rewards = []
+    block_rewards = [] 
+    is_running = True
+    ep = start_ep
+
+    try:
+        while is_running:
+            ep += 1
+            state, _ = env.reset()
+            ep_reward = 0
+            done = False
+            decay_steps = ep // DECAY_INTERVAL_EP
+            current_hit_reward = max(MIN_HIT_REWARD, BASE_HIT_REWARD - (decay_steps * DECAY_PER_STEP))
+            
+            current_action = 1
+            frame_count = 0
+
+            while not done:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT: is_running = False
+                if not is_running: break
+                
+                if frame_count % FRAME_SKIP == 0:
+                    current_action = agent.select_action(state)
+                
+                next_state, reward, done, _, _ = env.step(current_action, current_hit_reward)
+                agent.memory.push(state, current_action, reward, next_state, done)
+                
+                agent.total_steps += 1
+                if agent.total_steps % TRAIN_FREQ == 0: agent.learn()
+                
+                ep_reward += reward
+                state = next_state
+                frame_count += 1
+                env.render(episode=ep, ep_reward=ep_reward, current_epsilon=agent.epsilon, hit_reward=current_hit_reward)
+
+            if not is_running: break
+            episode_rewards.append(ep_reward)
+            block_rewards.append(ep_reward)
+            
+            if ep % 10 == 0:
+                avg_10 = sum(block_rewards) / 10
+                agent.save_checkpoint(FINAL_CHECKPOINT_PATH, ep)
+                # 終端機顯示精確的 10 回合平均獎勵
+                print(f"EP {ep} | 10回合平均獎勵: {avg_10:.1f} | 擊球獎勵: {current_hit_reward:.1f}")
+                block_rewards = [] 
+
+    except KeyboardInterrupt:
+        print("\n中斷並存檔。")
+    finally:
+        agent.save_checkpoint(FINAL_CHECKPOINT_PATH, ep)
+        pygame.quit()
+        if episode_rewards:
+            plt.figure(figsize=(12, 6))
+            plt.plot(episode_rewards, color='blue', alpha=0.15, label="Raw Score")
+            if len(episode_rewards) >= 10:
+                smooth = np.convolve(episode_rewards, np.ones(10)/10, mode='valid')
+                plt.plot(range(9, len(episode_rewards)), smooth, color='red', linewidth=2, label="10-EP Avg Reward")
+            plt.title("Pure Catch DQN Progress"); plt.show()
+
+if __name__ == '__main__':
+    start_live_training()
